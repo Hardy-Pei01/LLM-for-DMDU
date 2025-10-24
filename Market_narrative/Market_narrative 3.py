@@ -1,252 +1,261 @@
 import numpy as np
-from dataclasses import dataclass, field
-from typing import Dict, List, Tuple, Any
-
 
 # ============================================================
-# 1. Shared Environment
+# Shared Environment Definition
 # ============================================================
 
-@dataclass
-class Environment:
-    """Global market environment shared by all perspectives."""
-    T: int = 24
-    mu_D: float = 100.0
-    sigma_D: float = 10.0
-    mu_b: Dict[int, float] = field(default_factory=lambda: {1: 50, 2: 60, 3: 70})
-    sigma_b: Dict[int, float] = field(default_factory=lambda: {1: 5, 2: 5, 3: 5})
-    mu_p: Dict[int, float] = field(default_factory=lambda: {1: 40, 2: 45, 3: 50})
-    sigma_p: Dict[int, float] = field(default_factory=lambda: {1: 3, 2: 3, 3: 3})
-    G_bounds: Tuple[float, float] = (0, 100)
-    c_under: float = 20.0
-    c_over: float = 10.0
-    emissions: Dict[int, float] = field(default_factory=lambda: {1: 0.8, 2: 0.9, 3: 1.0})
-    delta: float = 0.05
+class MarketEnvironment:
+    """
+    Shared environment for the day-ahead electricity market.
+    Includes fixed constants, random variables, and market clearing.
+    """
 
-    def sample_state(self) -> Dict[str, Any]:
-        """Sample a random market state for one hour."""
-        D = np.random.normal(self.mu_D, self.sigma_D)
-        b = {i: np.random.normal(self.mu_b[i], self.sigma_b[i]) for i in range(1, 4)}
-        p = {i: np.random.normal(self.mu_p[i], self.sigma_p[i]) for i in range(1, 4)}
-        return {"D": D, "b": b, "p": p}
+    def __init__(self, uncertain_params):
+        """
+        uncertain_params: dictionary of uncertain parameters:
+            {
+                'G_bounds': [(float, float)]*24,
+                'price_cap': float
+            }
+        """
+        # Fixed constants (market baseline)
+        self.T = 24
+        self.mu_D, self.sigma_D = 1000.0, 100      # mean & std of demand
+        self.mu_b = [400, 350, 300]            # mean bid quantities
+        self.sigma_b = [50, 40, 30]
+        self.mu_p = [45, 50, 60]               # mean offer prices
+        self.sigma_p = [5, 5, 5]
 
+        # Uncertain parameters
+        self.params = uncertain_params
+        self.G_bounds = uncertain_params["G_bounds"]
+        self.price_cap = uncertain_params["price_cap"]
 
-# ============================================================
-# 2. System Operator (Market Clearing)
-# ============================================================
+    def sample_random_variables(self):
+        """Sample random demand and conventional producer bids."""
+        D = np.random.normal(self.mu_D, self.sigma_D, self.T)
+        b_i = [np.random.normal(self.mu_b[i], self.sigma_b[i], self.T) for i in range(3)]
+        p_i = [np.random.normal(self.mu_p[i], self.sigma_p[i], self.T) for i in range(3)]
+        return D, b_i, p_i
 
-class SystemOperator:
-    """Implements the merit-order market clearing mechanism."""
+    def market_clearing(self, D_t, bids_conventional, bids_renewable):
+        """
+        Simulate hourly market clearing.
+        - D_t: realized demand
+        - bids_conventional: list of (b_i, p_i)
+        - bids_renewable: (b_r, p_r)
+        Returns: (P_c, q_i, q_r)
+        """
+        offers = []
+        for i, (b_i, p_i) in enumerate(bids_conventional):
+            offers.append((p_i, b_i, f"conv_{i}"))
+        offers.append((bids_renewable[1], bids_renewable[0], "renewable"))
 
-    def __init__(self, env: Environment):
-        self.env = env
+        # Sort offers by ascending price (merit order)
+        offers.sort(key=lambda x: x[0])
 
-    def clear_market(self, bids: Dict[int, float], prices: Dict[int, float], D: float):
-        """Return clearing price and accepted quantities."""
-        # Sort producers by offer price
-        sorted_producers = sorted(prices.keys(), key=lambda i: prices[i])
-        cumulative = 0
-        P_t = 0
-        q = {i: 0.0 for i in prices.keys()}
-
-        for i in sorted_producers:
-            if cumulative + bids[i] < D:
-                q[i] = bids[i]
-                cumulative += bids[i]
-            else:
-                q[i] = max(0, D - cumulative)
-                P_t = prices[i]
-                cumulative = D
+        remaining_demand = D_t
+        q = {}
+        P_c = 0.0
+        for price, quantity, name in offers:
+            accepted = min(quantity, remaining_demand)
+            q[name] = accepted
+            remaining_demand -= accepted
+            if remaining_demand <= 1e-6:
+                P_c = price
                 break
 
-        if P_t == 0:  # all offers needed
-            P_t = prices[sorted_producers[-1]]
-        return P_t, q
+        # Fill zeros for unaccepted offers
+        for _, _, name in offers:
+            q.setdefault(name, 0.0)
+
+        q_i = [q.get(f"conv_{i}", 0.0) for i in range(3)]
+        q_r = q.get("renewable", 0.0)
+        return P_c, q_i, q_r
 
 
 # ============================================================
-# 3. Renewable Producer
+# Renewable Producer Perspective
 # ============================================================
 
 class RenewableProducer:
-    """Renewable producer's bidding and profit evaluation."""
-
-    def __init__(self, env: Environment, tau: float = 0.0, sigma: float = 0.0):
+    def __init__(self, env: MarketEnvironment, controls):
+        """
+        controls: {'b': [...], 'p': [...]}
+        """
         self.env = env
-        self.tau = tau        # carbon tax (affects market indirectly)
-        self.sigma = sigma    # renewable subsidy
+        self.b = np.array(controls["b"])
+        self.p = np.array(controls["p"])
 
-    def profit(self, b0: float, p0: float, G: float, P: float, accepted: float) -> float:
-        """Profit given generation, clearing price, and acceptance."""
-        c_under, c_over = self.env.c_under, self.env.c_over
-        under = max(0, b0 - G)
-        over = max(0, G - b0)
-        return (P + self.sigma) * accepted - c_under * under - c_over * over
+    def profit_per_hour(self, P_c, q_r, G_t, P_u, P_o):
+        """
+        Hourly profit function with penalty coefficients.
+        P_c: clearing price ($/MWh)
+        q_r: accepted quantity (MWh)
+        G_t: realized renewable generation (MWh)
+        P_u: under-delivery penalty coefficient ($/MWh)
+        P_o: over-delivery penalty coefficient ($/MWh)
+        """
+        under_delivery = max(0, q_r - G_t)
+        over_delivery = max(0, G_t - q_r)
+        return P_c * q_r - P_u * under_delivery - P_o * over_delivery
 
-    def expected_profit(self, market_states: List[Dict[str, Any]],
-                        bids0: List[float], prices0: List[float],
-                        so: SystemOperator) -> float:
-        """Compute expected profit across stochastic market states."""
-        profits = []
-        for t, state in enumerate(market_states):
-            D, b_conv, p_conv = state["D"], state["b"], state["p"]
-            b0, p0 = bids0[t], prices0[t]
+    def imbalance_per_hour(self, G_t, q_r):
+        """Absolute imbalance."""
+        return abs(G_t - q_r)
 
-            # combine all producers
-            all_bids = {0: b0, **b_conv}
-            all_prices = {0: p0, **p_conv}
-            P_t, q = so.clear_market(all_bids, all_prices, D)
+    def evaluate_objectives(self, env_realizations, penalties):
+        """
+        Compute expected robust profit and imbalance.
+        env_realizations: (D, b_i, p_i)
+        penalties: {'P_u': [...], 'P_o': [...]}
+        """
+        D, b_i, p_i = env_realizations
+        T = self.env.T
+        G_bounds = self.env.G_bounds
+        P_u, P_o = np.array(penalties["P_u"]), np.array(penalties["P_o"])
 
-            # sample renewable generation (robustly choose worst case)
-            G_min, G_max = self.env.G_bounds
-            # Worst case: generation opposite to accepted quantity direction
-            worst_G = G_min if b0 > (G_min + G_max) / 2 else G_max
-            profit = self.profit(b0, p0, worst_G, P_t, q[0])
-            profits.append(profit)
-        return float(np.mean(profits))
+        exp_profit, exp_imbalance = [], 0.0
+
+        for t in range(T):
+            bids_conventional = [(b_i[j][t], p_i[j][t]) for j in range(3)]
+            bids_renewable = (self.b[t], self.p[t])
+            P_c, _, q_r = self.env.market_clearing(D[t], bids_conventional, bids_renewable)
+
+            # Worst-case generation within bounds
+            G_low, G_high = G_bounds[t]
+            profit_low = self.profit_per_hour(P_c, q_r, G_low, P_u[t], P_o[t])
+            profit_high = self.profit_per_hour(P_c, q_r, G_high, P_u[t], P_o[t])
+            worst_profit = min(profit_low, profit_high)
+
+            imbalance_low = self.imbalance_per_hour(G_low, q_r)
+            imbalance_high = self.imbalance_per_hour(G_high, q_r)
+            worst_imbalance = max(imbalance_low, imbalance_high)
+
+            exp_profit.append(worst_profit)
+            exp_imbalance += worst_imbalance
+
+        return exp_profit, exp_imbalance
 
 
 # ============================================================
-# 4. Conventional Producers
+# System Regulator Perspective
 # ============================================================
 
-class ConventionalProducers:
-    """Exogenous stochastic actors with evaluative profit metrics."""
-
-    def __init__(self, env: Environment):
+class SystemRegulator:
+    def __init__(self, env: MarketEnvironment, controls):
+        """
+        controls: {'P_u': [...], 'P_o': [...]}
+        """
         self.env = env
+        self.P_u = np.array(controls["P_u"])
+        self.P_o = np.array(controls["P_o"])
 
-    def expected_profit(self, market_states: List[Dict[str, Any]],
-                        so: SystemOperator,
-                        bids0: List[float], prices0: List[float]) -> Dict[int, float]:
-        """Compute average profit for each conventional producer."""
-        profits = {i: [] for i in [1, 2, 3]}
-        for t, state in enumerate(market_states):
-            D, b_conv, p_conv = state["D"], state["b"], state["p"]
-            all_bids = {0: bids0[t], **b_conv}
-            all_prices = {0: prices0[t], **p_conv}
-            P_t, q = so.clear_market(all_bids, all_prices, D)
-            for i in [1, 2, 3]:
-                profits[i].append(P_t * q[i] - p_conv[i] * q[i])
-        return {i: float(np.mean(profits[i])) for i in profits}
+    def system_cost_per_hour(self, P_c, D_t, q_r, G_t, P_u, P_o):
+        """
+        Total system cost = total market payment + penalty costs.
+        Penalties increase total cost when imbalances occur.
+        """
+        under_delivery = max(0, q_r - G_t)
+        over_delivery = max(0, G_t - q_r)
+        return P_c * D_t + P_u * under_delivery + P_o * over_delivery
 
+    def evaluate_objectives(self, env_realizations, renewable_controls):
+        """
+        Compute expected system cost and imbalance.
+        env_realizations: (D, b_i, p_i)
+        renewable_controls: {'b': [...], 'p': [...]}
+        """
+        D, b_i, p_i = env_realizations
+        T = self.env.T
+        b_r, p_r = np.array(renewable_controls["b"]), np.array(renewable_controls["p"])
+        G_bounds = self.env.G_bounds
 
-# ============================================================
-# 5. Regulator
-# ============================================================
+        exp_cost, exp_imbalance = 0.0, 0.0
 
-class Regulator:
-    """Tracks environmental and policy objectives."""
+        for t in range(T):
+            bids_conventional = [(b_i[j][t], p_i[j][t]) for j in range(3)]
+            bids_renewable = (b_r[t], p_r[t])
+            P_c, _, q_r = self.env.market_clearing(D[t], bids_conventional, bids_renewable)
 
-    def __init__(self, env: Environment):
-        self.env = env
+            G_low, G_high = G_bounds[t]
+            cost_low = self.system_cost_per_hour(P_c, D[t], q_r, G_low, self.P_u[t], self.P_o[t])
+            cost_high = self.system_cost_per_hour(P_c, D[t], q_r, G_high, self.P_u[t], self.P_o[t])
+            worst_cost = max(cost_low, cost_high)
 
-    def evaluate(self, market_states: List[Dict[str, Any]],
-                 outputs: List[Dict[str, Any]]) -> Dict[str, float]:
-        """Compute emissions, renewable share, and cost objectives."""
-        total_E, total_R, total_cost = 0.0, 0.0, 0.0
-        for t, (state, out) in enumerate(zip(market_states, outputs)):
-            D = state["D"]
-            q = out["q"]
-            P = out["P"]
+            imbalance_low = abs(G_low - q_r)
+            imbalance_high = abs(G_high - q_r)
+            worst_imbalance = max(imbalance_low, imbalance_high)
 
-            # emissions and renewable share
-            E_t = sum(self.env.emissions[i] * q[i] for i in [1, 2, 3])
-            R_t = q[0] / D if D > 0 else 0
-            total_E += E_t
-            total_R += R_t
-            total_cost += P * D
+            exp_cost += worst_cost
+            exp_imbalance += worst_imbalance
 
-        return {
-            "emission_min": total_E,
-            "renewable_max": total_R,
-            "cost_min": total_cost
-        }
+        return exp_cost, exp_imbalance
 
 
 # ============================================================
-# 6. Unified Simulation Interface
+# Unified Simulation Interface
 # ============================================================
 
-def simulate_market(controls: Dict[str, Any],
-                    params: Dict[str, Any]) -> Dict[str, float]:
+def simulate_market(control_vars, uncertain_params):
     """
-    Simulate the unified market model.
+    Simulate unified market dynamics and return objective values.
 
-    Parameters
-    ----------
-    controls : dict
+    control_vars:
         {
-            'bids0': [b0_t for t in 1..24],
-            'prices0': [p0_t for t in 1..24],
-            'policy': {'tau': value, 'sigma': value}
+            'renewable': {'b': [...], 'p': [...]},
+            'regulator': {'P_u': [...], 'P_o': [...]}
         }
-    params : dict
-        Dictionary of environment parameter values.
 
-    Returns
-    -------
-    results : dict
-        Objective values for each perspective.
+    uncertain_params:
+        {
+            'G_bounds': [(low, high)] * 24,
+            'price_cap': float
+        }
+
+    Returns:
+        {
+            'renewable_profit': float,
+            'renewable_imbalance': float,
+            'system_cost': float,
+            'system_imbalance': float
+        }
     """
-    # Create environment
-    env = Environment(**params)
-    so = SystemOperator(env)
+    # 1. Initialize environment
+    env = MarketEnvironment(uncertain_params)
 
-    # Initialize perspectives
-    tau, sigma = controls.get("policy", {}).get("tau", 0.0), controls.get("policy", {}).get("sigma", 0.0)
-    renewable = RenewableProducer(env, tau=tau, sigma=sigma)
-    conventional = ConventionalProducers(env)
-    regulator = Regulator(env)
+    # 2. Sample random variables (demand and conventional bids)
+    D, b_i, p_i = env.sample_random_variables()
+    env_realizations = (D, b_i, p_i)
 
-    # Simulate stochastic market states
-    market_states = [env.sample_state() for _ in range(env.T)]
+    # 3. Initialize agents
+    renewable = RenewableProducer(env, control_vars["renewable"])
+    regulator = SystemRegulator(env, control_vars["regulator"])
 
-    # --- Renewable objectives ---
-    bids0 = controls["bids0"]
-    prices0 = controls["prices0"]
-    J_renewable = renewable.expected_profit(market_states, bids0, prices0, so)
+    # 4. Evaluate objectives
+    penalties = control_vars["regulator"]
+    profit, imbalance_r = renewable.evaluate_objectives(env_realizations, penalties)
+    cost, imbalance_sys = regulator.evaluate_objectives(env_realizations, control_vars["renewable"])
 
-    # --- Conventional metrics ---
-    J_conventional = conventional.expected_profit(market_states, so, bids0, prices0)
-
-    # --- Regulator evaluation ---
-    outputs = []
-    for t, state in enumerate(market_states):
-        D, b_conv, p_conv = state["D"], state["b"], state["p"]
-        all_bids = {0: bids0[t], **b_conv}
-        all_prices = {0: prices0[t], **p_conv}
-        P_t, q = so.clear_market(all_bids, all_prices, D)
-        outputs.append({"P": P_t, "q": q})
-    J_regulator = regulator.evaluate(market_states, outputs)
-
-    # --- System Operator diagnostics ---
-    balance_violation = np.mean([abs(s["D"] - sum(out["q"].values())) for s, out in zip(market_states, outputs)])
-    avg_price = np.mean([out["P"] for out in outputs])
-
-    # Return all objectives
-    results = {
-        "Renewable_expected_profit": J_renewable,
-        "Conventional_expected_profits": J_conventional,
-        "SystemOperator_balance_violation": balance_violation,
-        "SystemOperator_avg_price": avg_price,
-        "Regulator_emissions": J_regulator["emission_min"],
-        "Regulator_renewable_share": J_regulator["renewable_max"],
-        "Regulator_total_cost": J_regulator["cost_min"]
+    # 5. Return results
+    return {
+        "renewable_profit": profit,
+        "renewable_imbalance": imbalance_r,
+        "system_cost": cost,
+        "system_imbalance": imbalance_sys,
     }
-    return results
 
 
 # ============================================================
-# Example Usage (not executed)
+# Example (not executed)
 # ============================================================
+control_vars = {
+    'renewable': {'b': [220]*24, 'p': [50]*24},
+    'regulator': {'P_u': [100]*24, 'P_o': [50]*24}
+}
 
-# Example interface call (not to be run here):
-# controls = {
-#     "bids0": [50.0]*24,
-#     "prices0": [40.0]*24,
-#     "policy": {"tau": 10.0, "sigma": 5.0}
-# }
-# params = {"mu_D": 100.0, "sigma_D": 10.0}
-# results = simulate_market(controls, params)
-# print(results)
+t_lis = [np.random.uniform(150, 250) for i in range(24)]
+uncertain_params = {
+    'G_bounds': [(t_lis[i], t_lis[i]) for i in range(24)],
+    'price_cap': 100.0
+}
