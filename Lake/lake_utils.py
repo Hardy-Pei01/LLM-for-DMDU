@@ -1,5 +1,7 @@
 import numpy as np
 from scipy.optimize import brentq
+import matplotlib.pyplot as plt
+import pandas as pd
 
 # ============================================================
 # Shared Environment: Lake System
@@ -108,7 +110,7 @@ class LocalCommunity:
         Compute economic and environmental objectives for the local community.
         """
         T = len(A_L_series)
-        f_econ = sum(self.alpha * A_L_series[t] * (self.delta ** t) for t in range(T))
+        f_econ = [self.alpha * A_L_series[t] * (self.delta ** t) for t in range(T)]
         f_env = -sum(self.beta * max(0, X_series[t] - self.X_safe) for t in range(T))
         return {"economic": f_econ, "environmental": f_env}
 
@@ -139,7 +141,7 @@ class Regulator:
         Compute environmental and economic objectives for the regulator.
         """
         T = len(A_L_series)
-        f_env = -sum(self.gamma * max(0, X_series[t] - X_crit) for t in range(T))
+        f_env = [self.gamma * max(0, X_series[t] - X_crit) for t in range(T)]
         f_econ = sum(self.eta * A_L_series[t] * (self.delta ** t) for t in range(T))
         return {"environmental": f_env, "economic": f_econ}
 
@@ -238,11 +240,17 @@ def simulate_lake_problem(control_dict, uncertainty_dict):
     }
 
 
-# ============================================================
-# Example usage (not executed)
-# ============================================================
-a_L = [0.03] * 100
-a_R = [0] * 100
+a_L = [0.0306, 0.0485, 0.0373, 0.0375, 0.0477, 0.0466, 0.038, 0.0318, 0.0442, 0.0381, 0.0362, 0.0279, 0.0433,
+       0.0394, 0.0358, 0.0409, 0.0407, 0.036, 0.0413, 0.0375, 0.0328, 0.0417, 0.0447, 0.0324, 0.0397, 0.0402,
+       0.0389, 0.046, 0.0378, 0.0345, 0.0355, 0.0385, 0.036, 0.0389, 0.0328, 0.0364, 0.0453, 0.0392, 0.0386,
+       0.0386, 0.0375, 0.0456, 0.0354, 0.0315, 0.0479, 0.0373, 0.0302, 0.0444, 0.0316, 0.0454, 0.0381, 0.0442,
+       0.0426, 0.0474, 0.0373, 0.0383, 0.0385, 0.0376, 0.0385, 0.0388, 0.0399, 0.0398, 0.0391, 0.0371, 0.0388,
+       0.0418, 0.0499, 0.0418, 0.0508, 0.0352, 0.0449, 0.043, 0.0344, 0.0434, 0.053, 0.0355, 0.0444, 0.0375,
+       0.0443, 0.0342, 0.0257, 0.0328, 0.0409, 0.0302, 0.041, 0.041, 0.0346, 0.047, 0.0398, 0.038, 0.038,
+       0.0429, 0.0396, 0.0403, 0.0397, 0.0406, 0.0342, 0.0421, 0.043, 0.0341]
+# a_L = [0.03]*100
+a_R = [-0.01]*100
+
 control_inputs = {
     'a_L': a_L,
     'a_R': a_R
@@ -252,3 +260,39 @@ uncertain_params = {
     'alpha_L': 0.4, 'beta_L': 1, 'delta_L': 0.98, 'X_safe': 0,
     'gamma_R': 1, 'eta_R': 0, 'delta_R': 0
 }
+
+pollution = []
+community_benefit = []
+eutrophication = []
+for i in range(40):
+    results = simulate_lake_problem(control_inputs, uncertain_params)
+    pollution.append(results["Environment"]["X_series"])
+    community_benefit.append(results["LocalCommunity"]["economic"])
+    eutrophication.append(results["Regulator"]["environmental"])
+
+
+def envelope_diagram(value_list, y_label, title):
+    value_df = pd.DataFrame(value_list)
+    mean_list = value_df.mean()
+    std_list = value_df.std()
+    time_steps = [i for i in range(0, len(value_list[0]))]
+
+    plt.plot(time_steps, mean_list, label='Mean', color='red')
+
+    # 5. Plot the standard deviation as a shaded region (confidence interval)
+    # You can choose to plot 1 standard deviation, 2 standard deviations, etc.
+    plt.fill_between(time_steps, mean_list - std_list, mean_list + std_list,
+                     color='blue', alpha=0.2, label='Standard deviation')
+
+    # 6. Customize the plot
+    plt.xlabel('Time steps', size=14)
+    plt.ylabel(y_label, size=14)
+    plt.title(title, size=14)
+    plt.legend(fontsize=14)
+    plt.grid()
+    plt.tight_layout() # Adjust layout to prevent labels from overlapping
+    plt.show()
+
+envelope_diagram(pollution, 'Current lake pollution', 'Average Time Series of Current Lake Pollution')
+# envelope_diagram(community_benefit, 'Current economic benefit', 'Average Time Series of Current Economic Benefit')
+# envelope_diagram(eutrophication, 'Current eutrophication loss', 'Average Time Series of Current Eutrophication Loss')
